@@ -36,6 +36,8 @@ from training.config import (
     LOG_INTERVAL, EVAL_INTERVAL, PATIENCE,
     PRIMARY_METRIC, BEST_CKPT, LAST_CKPT,
     OUTPUT_DIR, LOG_DIR,
+    ADV_TRAIN_PROB, ADV_EPS, ADV_ALPHA, ADV_STEPS,
+    TARGET_AUC,
 )
 from training.model import build_loss, save_checkpoint
 from training.dataset import mixup_batch, cutmix_batch, LABEL_FAKE
@@ -166,6 +168,7 @@ def train_one_epoch(
     epoch: int,
     writer: SummaryWriter,
     ewc: EWC | None = None,
+    adv_training: bool = False,
 ) -> dict:
 
     model.train()
@@ -178,6 +181,19 @@ def train_one_epoch(
     for batch_idx, (images, labels) in enumerate(loader):
         images = images.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
+
+        # ── Adversarial augmentation (PGD, 20% of batches) ──
+        if adv_training and random.random() < ADV_TRAIN_PROB:
+            from training.adversarial import pgd_attack
+            # Must temporarily disable AMP and use float32 for PGD
+            model.eval()  # no dropout during attack generation
+            with torch.no_grad():
+                pass
+            model.train()
+            images = pgd_attack(
+                model, images, labels, criterion,
+                eps=ADV_EPS, alpha=ADV_ALPHA, steps=ADV_STEPS,
+            ).detach()
 
         # ── MixUp / CutMix (random choice per batch) ─────────
         mixup_data, cutmix_data = None, None
@@ -277,7 +293,10 @@ def train(
     val_loader,
     class_weights: torch.Tensor | None = None,
     ewc: EWC | None = None,
+    swad=None,
     run_name: str = "",
+    adv_training: bool = False,
+    target_auc: float = TARGET_AUC,
 ):
     """
     Full training loop.
@@ -336,9 +355,14 @@ def train(
 
         # ── Train ─────────────────────────────────────────────
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion, scaler, epoch, writer, ewc
+            model, train_loader, optimizer, criterion, scaler,
+            epoch, writer, ewc, adv_training=adv_training,
         )
         scheduler.step()
+
+        # ── SWAD: collect weights ─────────────────────────────
+        if swad is not None:
+            swad.update(model, epoch)
 
         # ── Validate ──────────────────────────────────────────
         if epoch % EVAL_INTERVAL == 0:
@@ -383,11 +407,10 @@ def train(
 
         metric_val = val_metrics.get(PRIMARY_METRIC.replace("val_", ""), 0)
         if metric_val > best_metric:
-            best_metric = metric_val
+            best_metric  = metric_val
             patience_cnt = 0
             save_checkpoint(model, optimizer, scheduler, epoch,
                             val_metrics, best_ckpt_path)
-            # Also save to the global best path used by inference code
             import shutil
             shutil.copy(best_ckpt_path, BEST_CKPT)
             print(f"  ✓ New best {PRIMARY_METRIC}={best_metric:.4f} — checkpoint saved")
@@ -397,6 +420,12 @@ def train(
                 print(f"\n[Trainer] Early stopping after {epoch} epochs "
                       f"(no improvement for {PATIENCE} epochs)")
                 break
+
+        # ── Target AUC early stop ─────────────────────────────
+        if val_metrics.get("auc", 0) >= target_auc:
+            print(f"\n[Trainer] Target AUC {target_auc:.3f} reached at epoch {epoch}. "
+                  f"Stopping early.")
+            break
 
     writer.close()
     print(f"\n[Trainer] Done. Best {PRIMARY_METRIC}={best_metric:.4f}")

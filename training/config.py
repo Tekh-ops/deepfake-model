@@ -13,16 +13,18 @@ import torch
 # ─────────────────────────────────────────────────────────────
 
 def get_device():
+    # Priority: CUDA (RTX 3070) > MPS (M1) > CPU
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        n_gpus = torch.cuda.device_count()
+        device   = torch.device("cuda")
+        n_gpus   = torch.cuda.device_count()
         gpu_name = torch.cuda.get_device_name(0)
-        print(f"[config] GPU: {gpu_name}  ({n_gpus} device(s))")
+        vram_gb  = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"[config] GPU: {gpu_name}  ({n_gpus} device(s), {vram_gb:.1f} GB VRAM)")
         return device, n_gpus
     if torch.backends.mps.is_available():
-        print("[config] Using Apple MPS (M1/M2)")
+        print("[config] Apple MPS (M1/M2 — dev mode)")
         return torch.device("mps"), 1
-    print("[config] WARNING: No GPU found — using CPU")
+    print("[config] WARNING: No GPU — CPU only (training will be very slow)")
     return torch.device("cpu"), 1
 
 DEVICE, NUM_GPUS = get_device()
@@ -65,12 +67,11 @@ os.makedirs(CACHE_DIR,  exist_ok=True)
 # Each leaf folder contains flat JPEG/PNG frames (no sub-folders).
 
 DATASET_ROOTS = {
-    "ff_plus":  os.path.join(DATA_ROOT, "ff_plus"),
-    "dfdc":     os.path.join(DATA_ROOT, "dfdc"),
-    "celebdf":  os.path.join(DATA_ROOT, "celebdf"),
-    "wild":     os.path.join(DATA_ROOT, "wild"),
-    "extra":    os.path.join(DATA_ROOT, "extra_real"),   # real partner
-    "extra_f":  os.path.join(DATA_ROOT, "extra_fake"),   # fake partner
+    "celebdf":    os.path.join(DATA_ROOT, "celebdf"),
+    "celebdf_v2": os.path.join(DATA_ROOT, "celebdf_v2"),
+    "dfdc":       os.path.join(DATA_ROOT, "dfdc"),
+    "asvspoof":   os.path.join(DATA_ROOT, "asvspoof"),
+    "ffhq":       os.path.join(DATA_ROOT, "ffhq"),
 }
 
 # Only include datasets whose folders actually exist
@@ -95,27 +96,31 @@ LAST_CKPT       = os.path.join(OUTPUT_DIR, "last_efficientnet_b4.pth")
 # Training hyperparameters
 # ─────────────────────────────────────────────────────────────
 
-EPOCHS              = 30
-BATCH_SIZE          = 32         # per GPU — effective batch = BATCH_SIZE * NUM_GPUS
-ACCUMULATION_STEPS  = 2          # gradient accumulation (effective batch *= this)
-NUM_WORKERS         = 8          # DataLoader workers
+# ── RTX 3070 (8 GB VRAM) optimised settings ─────────────────
+# Memory budget: ~6.5 GB effective  (0.5 OS + 1 GB activations buffer)
+# EfficientNet-B4 @ 224px: ~420 MB / batch of 16
+EPOCHS              = 40
+BATCH_SIZE          = 24         # per GPU — fits in 8 GB with AMP
+ACCUMULATION_STEPS  = 4          # effective batch = 24 × 4 = 96 samples
+NUM_WORKERS         = 8          # i9-10900X has 20 threads; 8 is sweet spot
 PIN_MEMORY          = True
 
 # Optimiser
-LEARNING_RATE       = 3e-4       # initial LR for the new classification head
-BACKBONE_LR         = 3e-5       # 10x lower for the pretrained backbone
+LEARNING_RATE       = 2e-4       # new head (classifier + SRM branch)
+BACKBONE_LR         = 1.5e-5    # pretrained backbone — 13× lower
 WEIGHT_DECAY        = 1e-4
 BETAS               = (0.9, 0.999)
 GRAD_CLIP           = 1.0        # max gradient norm
 
 # LR schedule
-WARMUP_EPOCHS       = 3          # linear warmup
-LR_MIN              = 1e-6       # cosine annealing floor
+WARMUP_EPOCHS       = 4          # linear warmup
+LR_MIN              = 5e-7       # cosine annealing floor
 
 # Regularisation
 LABEL_SMOOTHING     = 0.1        # prevents overconfidence
-MIXUP_ALPHA         = 0.2        # MixUp augmentation strength (0 = off)
+MIXUP_ALPHA         = 0.4        # strong MixUp — prevents overfit
 CUTMIX_PROB         = 0.5        # probability of CutMix augmentation
+DROPOUT_RATE        = 0.4
 
 # Class weighting (addresses real/fake imbalance in some datasets)
 # Set to None to disable (uses loss-level class weights instead)
@@ -138,15 +143,34 @@ MAX_PER_DATASET = None     # e.g. 10000
 # Augmentation
 # ─────────────────────────────────────────────────────────────
 
-# JPEG compression simulation — deepfakes are always re-encoded on social media
-JPEG_QUALITY_RANGE  = (50, 95)
+# JPEG compression simulation (social media re-encoding)
+JPEG_QUALITY_RANGE  = (40, 95)   # wider range than before — more realistic
 
 # Horizontal flip probability
 HFLIP_PROB          = 0.5
 
+# RandAugment
+RANDAUGMENT_N       = 2          # number of augmentation ops per image
+RANDAUGMENT_M       = 9          # magnitude of each op
+
 # Random erasing (simulates occlusion)
 ERASE_PROB          = 0.2
 ERASE_SCALE         = (0.02, 0.15)
+
+# ── AMP (Automatic Mixed Precision) ──────────────────────────
+# ALWAYS True on CUDA — critical for 8 GB VRAM
+USE_AMP             = True
+
+# ── Adversarial training ──────────────────────────────────────
+ADV_TRAIN_PROB      = 0.20       # 20% of batches get PGD adversarial examples
+ADV_EPS             = 4 / 255    # L∞ ball radius
+ADV_ALPHA           = 1 / 255    # PGD step size
+ADV_STEPS           = 7          # PGD steps per batch
+
+# ── SWAD (domain generalisation) ─────────────────────────────
+# Collect weights during the last 40% of training
+SWAD_START_FRAC     = 0.60       # start collecting at 60% through training
+SWAD_ENABLED        = True
 
 # ─────────────────────────────────────────────────────────────
 # Logging and checkpointing
@@ -154,8 +178,11 @@ ERASE_SCALE         = (0.02, 0.15)
 
 LOG_INTERVAL    = 50          # log every N batches
 EVAL_INTERVAL   = 1           # evaluate on validation every N epochs
-SAVE_TOP_K      = 3           # keep best K checkpoints
-PATIENCE        = 7           # early stopping patience (epochs)
+SAVE_TOP_K      = 3           # keep best K checkpoints (KEEP_BEST)
+KEEP_BEST       = 3           # alias
+PATIENCE        = 8           # early stopping patience (epochs)
+SAVE_EVERY      = 2           # save checkpoint every N epochs
 
 # Metrics to track
 PRIMARY_METRIC  = "val_auc"   # metric for best model selection
+TARGET_AUC      = 0.95        # early stop if AUC exceeds this
