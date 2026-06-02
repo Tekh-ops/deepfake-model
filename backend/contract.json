@@ -1,0 +1,13 @@
+{
+  "input": {
+    "file": "image.jpg"
+  },
+  "output": {
+    "file_name": "image.jpg",
+    "result": "Fake",
+    "confidence": 0.82,
+    "hash": "string",
+    "timestamp": "YYYY-MM-DD HH:MM:SS",
+    "legal_notice": "string"
+  }
+}

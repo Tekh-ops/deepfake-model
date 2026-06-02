@@ -37,9 +37,9 @@ from config import (
 )
 
 # ── Utils ─────────────────────────────────────────────────────
-from utils.metadata import create_metadata
-from utils.legal    import generate_legal_notice
-from utils.hashing  import (
+from modules.metadata_analysis.metadata import create_metadata
+from modules.core.legal    import generate_legal_notice
+from modules.metadata_analysis.hashing  import (
     compute_sha256,
     append_audit_entry,
     verify_audit_chain,
@@ -47,7 +47,7 @@ from utils.hashing  import (
 )
 
 # ── ML pipeline ───────────────────────────────────────────────
-from models.ensemble import run_detection
+from modules.core.ensemble import run_detection
 
 # ── Flask setup ───────────────────────────────────────────────
 app = Flask(__name__)
@@ -150,6 +150,15 @@ def _process_file(file_path: str) -> dict:
     fake_prob  = detection["fake_prob"]
     risk_level = detection.get("risk_level", "MEDIUM")
 
+    if media_type == "image" and result == "Fake":
+        try:
+            from modules.image_analysis.gradcam import generate_gradcam_secondary
+            gradcam_path = os.path.join(UPLOAD_FOLDER, f"gradcam_{submission_id}.png")
+            generate_gradcam_secondary(file_path, save_path=gradcam_path)
+        except Exception as e:
+            print("GradCAM auto-generation failed:", e)
+
+
     # ── Step 4: Audit log — DETECTION COMPLETE ────────────────
     append_audit_entry(
         submission_id = submission_id,
@@ -169,7 +178,7 @@ def _process_file(file_path: str) -> dict:
                           "note": "Fact-check not run (image input)"}
     if media_type in ("video", "audio"):
         try:
-            from factcheck.pipeline import run_factcheck_pipeline
+            from modules.factcheck.pipeline import run_factcheck_pipeline
             fact_check_result = run_factcheck_pipeline(
                 media_path = file_path,
                 media_type = media_type,
@@ -229,9 +238,12 @@ def _process_file(file_path: str) -> dict:
     # ── Step 7: Legal report generation ───────────────────────
     try:
         import sys
-        if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from legal import MediaEvidence, generate_all_documents
+        # Add the root directory to path to allow absolute imports
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        if root_dir not in sys.path:
+            sys.path.insert(0, root_dir)
+            
+        from bharatshield_legal.legal2 import MediaEvidence, generate_all_documents
         
         evidence = MediaEvidence()
         evidence.case_id = submission_id
@@ -264,7 +276,7 @@ def _process_file(file_path: str) -> dict:
         actor         = "compliance_layer",
         extra         = {
             "risk_level":       risk_level,
-            "takedown_advised": notice.get("takedown_advised", False) if notice else False,
+            "takedown_advised": risk_level == "HIGH",
             "fact_check_available": fact_check_result.get("available", False),
         },
     )
@@ -404,7 +416,7 @@ def gradcam():
     heatmap_path = f"/tmp/gradcam_{uuid.uuid4().hex[:8]}.png"
 
     try:
-        from utils.gradcam import generate_gradcam_secondary
+        from modules.image_analysis.gradcam import generate_gradcam_secondary
         generate_gradcam_secondary(file_path, save_path=heatmap_path)
         return send_file(heatmap_path, mimetype="image/png")
 
@@ -470,6 +482,15 @@ def get_legal_report(submission_id):
     if os.path.exists(pdf_path):
         return send_file(pdf_path, mimetype="application/pdf", as_attachment=True, download_name=f"BharatShield_Legal_{submission_id}.pdf")
     return jsonify({"error": "Report not found or not generated"}), 404
+
+@app.route("/gradcam/<submission_id>", methods=["GET"])
+def get_gradcam(submission_id):
+    """Get the auto-generated GradCAM heatmap for an image."""
+    from flask import send_file
+    path = os.path.join(UPLOAD_FOLDER, f"gradcam_{submission_id}.png")
+    if os.path.exists(path):
+        return send_file(path, mimetype="image/png")
+    return jsonify({"error": "GradCAM not found or not generated for this submission"}), 404
 
 # ─────────────────────────────────────────────────────────────
 # Error handlers

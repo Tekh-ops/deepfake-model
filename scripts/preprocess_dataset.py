@@ -29,7 +29,7 @@ from tqdm import tqdm
 # Add project root to path so we can import utils
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.video_utils import extract_frames_uniform, extract_audio, crop_face_pil
+from modules.core.video_utils import extract_frames_uniform, extract_audio, crop_face_pil
 
 
 def parse_args():

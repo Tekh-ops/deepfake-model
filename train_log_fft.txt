@@ -1,0 +1,1 @@
+python fusion_eval.py --generate_fft_scores --data_dir ..\final_dataset_aligned --fft_model_path fft_output/best_fft_model.pth --fft_scores_out fft_output/val_scores.npz
